@@ -37,6 +37,7 @@ type GeocodeRequestPayload = {
 type CreateReclamoResponse = {
   correlationId: string;
   reclamoId: string;
+  trackingCode: string;
   status: string;
   canal: string;
   contactKey: string;
@@ -99,6 +100,33 @@ export class AiProcessService {
     // Si el flujo ya está cerrado (reclamo creado), evita re-preguntas automáticas
     // frente a eventos ruidosos/ambiguos y solo reabre con una intención clara.
     if (existing?.phase === 'closed') {
+      if (this.isGreetingMessage(payload.consolidatedText)) {
+        const greetingMessage =
+          'Hola de nuevo. Si queres crear otro reclamo, enviame en un solo mensaje: correo o DNI, descripcion del problema y direccion exacta.';
+
+        const reopenedByGreeting: ConversationState = {
+          contactKey: payload.contactKey,
+          phase: 'collecting_claim_data',
+          greeted: true,
+          mensajes: [
+            this.makeMensaje('usuario', payload.consolidatedText),
+            this.makeMensaje('asistente', greetingMessage),
+          ],
+          updatedAt: new Date().toISOString(),
+        };
+
+        await this.saveConversationState(reopenedByGreeting);
+
+        return {
+          correlationId: payload.correlationId,
+          contactKey: payload.contactKey,
+          status: 'conversation_reopened_by_greeting',
+          shouldAskAgain: true,
+          assistantMessage: greetingMessage,
+          state: reopenedByGreeting,
+        };
+      }
+
       const shouldRestart = this.shouldRestartAfterClosure(payload.consolidatedText);
 
       if (!shouldRestart) {
@@ -168,6 +196,32 @@ export class AiProcessService {
         shouldAskAgain: true,
         assistantMessage: greetingMessage,
         state: newState,
+      };
+    }
+
+    if (this.isGreetingMessage(payload.consolidatedText)) {
+      const greetingMessage =
+        'Hola. Para crear tu reclamo necesito que me envies en un solo mensaje: correo o DNI, descripcion del problema y direccion exacta.';
+      const greetingState = this.appendAsistente(
+        {
+          ...existing,
+          mensajes: [
+            ...(existing.mensajes || []),
+            this.makeMensaje('usuario', payload.consolidatedText),
+          ],
+          updatedAt: new Date().toISOString(),
+        },
+        greetingMessage,
+      );
+      await this.saveConversationState(greetingState);
+
+      return {
+        correlationId: payload.correlationId,
+        contactKey: payload.contactKey,
+        status: 'greeting_guidance',
+        shouldAskAgain: true,
+        assistantMessage: greetingMessage,
+        state: greetingState,
       };
     }
 
@@ -292,6 +346,7 @@ export class AiProcessService {
       assistantMessage: claimCreation.reclamo.message,
       reclamo: {
         reclamoId: claimCreation.reclamo.reclamoId,
+        trackingCode: claimCreation.reclamo.trackingCode,
         status: claimCreation.reclamo.status,
         createdAt: claimCreation.reclamo.createdAt,
       },
@@ -432,6 +487,33 @@ export class AiProcessService {
     const hasProblemLike = /\b(sin\s+luz|sin\s+agua|corte|fuga|rotura|bache|reclamo|problema)\b/.test(normalized);
 
     return hasIdentity && hasAddressLike && hasProblemLike;
+  }
+
+  private isGreetingMessage(text: string): boolean {
+    const normalized = text
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim();
+
+    if (!normalized) {
+      return false;
+    }
+
+    const hasGreeting = /\b(hola|buenas|buen dia|buenos dias|buenas tardes|buenas noches|que tal)\b/.test(
+      normalized,
+    );
+
+    if (!hasGreeting) {
+      return false;
+    }
+
+    const hasIdentity = /\b\d{7,8}\b/.test(normalized) || /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/.test(normalized);
+    const hasAddressLike = /\b(calle|av\.?|avenida|pasaje|ruta|nro|numero|altura|\d{3,5})\b/.test(normalized);
+    const hasProblemLike = /\b(sin\s+luz|sin\s+agua|corte|fuga|rotura|bache|reclamo|problema)\b/.test(normalized);
+
+    // Solo se considera saludo "puro" para no interceptar mensajes con datos de reclamo.
+    return !hasIdentity && !hasAddressLike && !hasProblemLike;
   }
 
   private getAllowedAreaTokens(): string[] {
