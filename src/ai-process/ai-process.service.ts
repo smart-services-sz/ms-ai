@@ -26,6 +26,13 @@ type GeocodeResponse = {
   };
 };
 
+type GeocodeRequestPayload = {
+  correlationId: string;
+  address: string;
+  country: string;
+  city?: string;
+};
+
 // Respuesta tipada del microservicio ms-reclamos (tópico: reclamos.create).
 type CreateReclamoResponse = {
   correlationId: string;
@@ -66,6 +73,12 @@ export class AiProcessService {
       'AI_CONVERSATION_TTL_SECONDS',
       86400,
     );
+
+    if (!this.getAllowedAreaTokens().length) {
+      this.logger.warn(
+        'GEO_ALLOWED_ADMIN_AREAS no esta configurado; la validacion de cobertura geografica quedara abierta',
+      );
+    }
   }
 
   // Punto de entrada del servicio. Ejecuta la máquina de estados:
@@ -82,6 +95,53 @@ export class AiProcessService {
     );
 
     const existing = await this.getConversationState(payload.contactKey);
+
+    // Si el flujo ya está cerrado (reclamo creado), evita re-preguntas automáticas
+    // frente a eventos ruidosos/ambiguos y solo reabre con una intención clara.
+    if (existing?.phase === 'closed') {
+      const shouldRestart = this.shouldRestartAfterClosure(payload.consolidatedText);
+
+      if (!shouldRestart) {
+        const closedState = {
+          ...existing,
+          updatedAt: new Date().toISOString(),
+        };
+        await this.saveConversationState(closedState);
+
+        return {
+          correlationId: payload.correlationId,
+          contactKey: payload.contactKey,
+          status: 'conversation_closed_no_action',
+          shouldAskAgain: false,
+          state: closedState,
+        };
+      }
+
+      // Reinicia la captura para un nuevo reclamo en la misma conversación.
+      const reopenedState: ConversationState = {
+        contactKey: payload.contactKey,
+        phase: 'collecting_claim_data',
+        greeted: true,
+        mensajes: [this.makeMensaje('usuario', payload.consolidatedText)],
+        updatedAt: new Date().toISOString(),
+      };
+
+      await this.saveConversationState(reopenedState);
+
+      const restartMessage =
+        'Perfecto, iniciemos un nuevo reclamo. Enviame en un solo mensaje: correo o DNI, descripcion del problema y direccion exacta.';
+      const restartedState = this.appendAsistente(reopenedState, restartMessage);
+      await this.saveConversationState(restartedState);
+
+      return {
+        correlationId: payload.correlationId,
+        contactKey: payload.contactKey,
+        status: 'conversation_restarted',
+        shouldAskAgain: true,
+        assistantMessage: restartMessage,
+        state: restartedState,
+      };
+    }
 
     // Primer turno: el contacto nunca habló o su estado expiró en Redis.
     if (!existing || !existing.greeted) {
@@ -218,7 +278,10 @@ export class AiProcessService {
       };
     }
 
-    const finalState = this.appendAsistente(mergedState, claimCreation.reclamo.message);
+    const finalState = this.appendAsistente(
+      { ...mergedState, phase: 'closed' },
+      claimCreation.reclamo.message,
+    );
     await this.saveConversationState(finalState);
 
     return {
@@ -269,16 +332,27 @@ export class AiProcessService {
 
     const country = (components.country || '').toLowerCase();
     const adminArea = (components.adminArea || '').toLowerCase();
+    const locality = (components.locality || '').toLowerCase();
 
     if (allowedCountries.length && country && !allowedCountries.includes(country)) {
       return false;
     }
 
-    if (allowedAdminAreas.length && adminArea) {
-      const matchesAdmin = allowedAdminAreas.some(
-        a => adminArea.includes(a) || a.includes(adminArea),
+    if (allowedAdminAreas.length) {
+      const scopeCandidates = [adminArea, locality].filter(Boolean);
+
+      // Si Google no devuelve componentes geográficos útiles, no se bloquea por zona.
+      if (!scopeCandidates.length) {
+        return true;
+      }
+
+      const matchesScope = allowedAdminAreas.some((allowed) =>
+        scopeCandidates.some(
+          (candidate) => candidate.includes(allowed) || allowed.includes(candidate),
+        ),
       );
-      if (!matchesAdmin) return false;
+
+      if (!matchesScope) return false;
     }
 
     return true;
@@ -340,7 +414,74 @@ export class AiProcessService {
     return {
       ...state,
       mensajes: [...(state.mensajes || []), this.makeMensaje('asistente', texto)],
+      updatedAt: new Date().toISOString(),
     };
+  }
+
+  private shouldRestartAfterClosure(text: string): boolean {
+    const normalized = text.toLowerCase();
+
+    // Señales de apertura explícita de un nuevo reclamo.
+    if (/\b(nuevo\s+reclamo|otro\s+reclamo|iniciar\s+reclamo|abrir\s+reclamo)\b/.test(normalized)) {
+      return true;
+    }
+
+    // Si trae identidad y contenido sustancial, se considera nuevo inicio.
+    const hasIdentity = /\b\d{7,8}\b/.test(normalized) || /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/.test(normalized);
+    const hasAddressLike = /\b(calle|av\.?|avenida|pasaje|ruta|nro|numero|altura|\d{3,5})\b/.test(normalized);
+    const hasProblemLike = /\b(sin\s+luz|sin\s+agua|corte|fuga|rotura|bache|reclamo|problema)\b/.test(normalized);
+
+    return hasIdentity && hasAddressLike && hasProblemLike;
+  }
+
+  private getAllowedAreaTokens(): string[] {
+    return this.configService
+      .get<string>('GEO_ALLOWED_ADMIN_AREAS', '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  private resolveCityHint(address: string): string | undefined {
+    const normalizedAddress = address.toLowerCase();
+    const allowedTokens = this.getAllowedAreaTokens();
+
+    // Si la dirección ya incluye una zona permitida, no agrega hint adicional.
+    const alreadyScoped = allowedTokens.some((token) =>
+      normalizedAddress.includes(token.toLowerCase()),
+    );
+    if (alreadyScoped) {
+      return undefined;
+    }
+
+    // Prioriza variable dedicada y luego primer token de zona permitida.
+    const configuredCity = this.configService.get<string>('GEO_DEFAULT_CITY')?.trim();
+    if (configuredCity) {
+      return configuredCity;
+    }
+
+    return allowedTokens[0];
+  }
+
+  private async geocodeAddress(
+    payload: AiInboundPayloadDto,
+    address: string,
+  ): Promise<GeocodeResponse> {
+    const country = this.configService.get<string>('GEO_DEFAULT_COUNTRY', 'Argentina');
+    const city = this.resolveCityHint(address);
+
+    const requestPayload: GeocodeRequestPayload = {
+      correlationId: payload.correlationId,
+      address,
+      country,
+      ...(city ? { city } : {}),
+    };
+
+    return firstValueFrom(
+      this.natsClient
+        .send<GeocodeResponse>('geo.geocode-address', requestPayload)
+        .pipe(timeout(10000)),
+    );
   }
 
   private intFromConfig(key: string, fallback: number): number {
@@ -371,15 +512,7 @@ export class AiProcessService {
     }
 
     try {
-      const geocode = await firstValueFrom(
-        this.natsClient
-          .send<GeocodeResponse>('geo.geocode-address', {
-            correlationId: payload.correlationId,
-            address: state.direccion,
-            country: 'Argentina',
-          })
-          .pipe(timeout(10000)),
-      );
+      const geocode = await this.geocodeAddress(payload, state.direccion);
 
       if (!geocode || !geocode.data) {
         return { success: false, error: 'No hubo respuesta valida de geolocalizacion' };

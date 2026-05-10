@@ -31,6 +31,36 @@
 $ npm install
 ```
 
+## Configuracion de entorno (regla de cobertura)
+
+El microservicio valida la direccion del reclamo contra un area de cobertura definida por variables de entorno.
+La regla de negocio es: solo se aceptan reclamos dentro del area configurada.
+
+Variables recomendadas:
+
+```env
+NATS_SERVERS=nats://localhost:4222
+OPENAI_API_KEY=<tu_api_key>
+OPENAI_MODEL=gpt-4o-mini
+
+# Cobertura geografica
+GEO_ALLOWED_COUNTRIES=Argentina
+GEO_ALLOWED_ADMIN_AREAS=Funes,Santa Fe
+
+# Hint para geocodificacion cuando el usuario no escribe ciudad
+GEO_DEFAULT_CITY=Funes
+GEO_DEFAULT_COUNTRY=Argentina
+
+# TTL de conversacion en Redis
+AI_CONVERSATION_TTL_SECONDS=86400
+```
+
+Notas:
+
+- GEO_ALLOWED_ADMIN_AREAS acepta una lista separada por coma.
+- Para este caso, Funes,Santa Fe aplica la cobertura en localidad y provincia.
+- GEO_DEFAULT_CITY mejora la geocodificacion de direcciones incompletas como "Brown 2704".
+
 ## Compile and run the project
 
 ```bash

@@ -3,7 +3,11 @@ import { ClaimCategoria, ClaimPrioridad } from '../ai-interpreter.service';
 // Fase actual del flujo conversacional.
 // - awaiting_identity_and_claim: primer contacto, aún no se saludó al usuario.
 // - collecting_claim_data: ya se saludó; se está recopilando datos del reclamo.
-export type ConversationPhase = 'awaiting_identity_and_claim' | 'collecting_claim_data';
+// - closed: reclamo creado; la conversación queda cerrada hasta nuevo inicio explícito.
+export type ConversationPhase =
+  | 'awaiting_identity_and_claim'
+  | 'collecting_claim_data'
+  | 'closed';
 
 // Entrada individual del historial de la conversación, persistida en Redis.
 export type MensajeEntry = {
