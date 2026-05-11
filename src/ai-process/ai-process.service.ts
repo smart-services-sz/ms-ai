@@ -226,8 +226,10 @@ export class AiProcessService {
     }
 
     // Extrae datos del texto del usuario con OpenAI (o fallback regex).
+    // Usa contactKey como identificador único del cliente para rate limiting y seguridad.
     const parsed = await this.aiInterpreterService.parseClaimText(
       payload.consolidatedText,
+      payload.contactKey, // clientId para rate limiting y auditoría
     );
 
     // Fusiona los datos nuevos con los ya acumulados en estado previo.

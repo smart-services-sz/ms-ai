@@ -3,6 +3,7 @@ import { ClientsModule, Transport } from '@nestjs/microservices';
 import { AiProcessController } from './ai-process.controller';
 import { AiProcessService } from './ai-process.service';
 import { AiInterpreterService } from './ai-interpreter.service';
+import { AiSecurityService } from './ai-security.service';
 
 @Module({
   imports: [
@@ -17,6 +18,6 @@ import { AiInterpreterService } from './ai-interpreter.service';
     ]),
   ],
   controllers: [AiProcessController],
-  providers: [AiProcessService, AiInterpreterService],
+  providers: [AiProcessService, AiInterpreterService, AiSecurityService],
 })
 export class AiProcessModule {}
