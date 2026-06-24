@@ -97,6 +97,34 @@ export class AiProcessService {
 
     const existing = await this.getConversationState(payload.contactKey);
 
+    if (this.isCancelMessage(payload.consolidatedText)) {
+      const cancelMessage =
+        'Listo, cancele este flujo. Cuando quieras crear un reclamo nuevo, enviame en un solo mensaje: correo o DNI, descripcion del problema y direccion exacta.';
+
+      const canceledState: ConversationState = {
+        contactKey: payload.contactKey,
+        phase: 'closed',
+        greeted: true,
+        mensajes: [
+          ...(existing?.mensajes || []),
+          this.makeMensaje('usuario', payload.consolidatedText),
+          this.makeMensaje('asistente', cancelMessage),
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+
+      await this.saveConversationState(canceledState);
+
+      return {
+        correlationId: payload.correlationId,
+        contactKey: payload.contactKey,
+        status: 'conversation_cancelled',
+        shouldAskAgain: false,
+        assistantMessage: cancelMessage,
+        state: canceledState,
+      };
+    }
+
     // Si el flujo ya está cerrado (reclamo creado), evita re-preguntas automáticas
     // frente a eventos ruidosos/ambiguos y solo reabre con una intención clara.
     if (existing?.phase === 'closed') {
@@ -516,6 +544,22 @@ export class AiProcessService {
 
     // Solo se considera saludo "puro" para no interceptar mensajes con datos de reclamo.
     return !hasIdentity && !hasAddressLike && !hasProblemLike;
+  }
+
+  private isCancelMessage(text: string): boolean {
+    const normalized = text
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim();
+
+    if (!normalized) {
+      return false;
+    }
+
+    return /\b(cancelar|cancela|cancelalo|anular|anulalo|detener|detenelo|salir|finalizar|terminar|cerrar)\b/.test(
+      normalized,
+    );
   }
 
   private getAllowedAreaTokens(): string[] {
