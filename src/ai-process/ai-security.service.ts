@@ -121,11 +121,12 @@ export class AiSecurityService {
       );
     }
 
-    // Verificar que haya mínimalmente keywords de reclamos válidos
-    // (permisivo: solo 1 palabra clave o 20+ caracteres)
+    // Verificar que haya mínimalmente señales de reclamo válidas
+    // (permisivo: 20+ caracteres, keyword de reclamo, o patrón de dirección)
     if (
       trimmed.length > 20 ||
-      this.hasClaimKeywords(trimmed)
+      this.hasClaimKeywords(trimmed) ||
+      this.hasAddressLikePattern(trimmed)
     ) {
       return trimmed;
     }
@@ -358,5 +359,30 @@ export class AiSecurityService {
       }
     }
     return false;
+  }
+
+  /**
+   * Heurística para aceptar direcciones breves válidas
+   * (ej: "montevideo 1963", "av pellegrini 1200").
+   */
+  private hasAddressLikePattern(input: string): boolean {
+    const normalized = input.trim().toLowerCase();
+
+    // Requiere letras y números para evitar aceptar ruido como "123" o "hola".
+    const hasLetters = /[a-záéíóúñ]/i.test(normalized);
+    const hasDigits = /\d/.test(normalized);
+
+    if (!hasLetters || !hasDigits) {
+      return false;
+    }
+
+    // Mínimo de longitud para evitar falsos positivos triviales.
+    if (normalized.length < 8) {
+      return false;
+    }
+
+    // Patrones comunes de calle + numeración.
+    const addressRegex = /(?:\b(?:calle|av\.?|avenida|pasaje|pje\.?|ruta|boulevard|blvd\.?|diag\.?|diagonal)\b\s+)?[a-záéíóúñ][a-záéíóúñ\s'.-]{2,}\s+\d{1,5}(?:\s*(?:bis|dpto\.?\s*\w+|depto\.?\s*\w+|piso\s*\w+))?$/i;
+    return addressRegex.test(normalized);
   }
 }

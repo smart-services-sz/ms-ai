@@ -151,15 +151,22 @@ export class AiInterpreterService {
     const dniMatch = input.match(/\b\d{7,8}\b/);
 
     const lowered = input.toLowerCase();
-    const problemaHint =
-      /(fuga|corte|rotura|poste|basura|bache|inund|sin luz|sin agua|cloaca|reclamo)/.test(
-        lowered,
-      ) || input.length > 20;
+    const hasProblemKeywords = /(fuga|corte|rotura|poste|basura|bache|inund|sin luz|sin agua|cloaca|reclamo|problema|no funciona|perdida|pérdida)/.test(
+      lowered,
+    );
+
+    // Calle + altura (ej: "montevideo 1963", "av pellegrini 1200").
+    const hasAddressLikePattern = /(?:\b(?:calle|av\.?|avenida|pasaje|pje\.?|ruta|boulevard|blvd\.?|diag\.?|diagonal)\b\s+)?[a-záéíóúñ][a-záéíóúñ\s'.-]{2,}\s+\d{1,5}(?:\s*(?:bis|dpto\.?\s*\w+|depto\.?\s*\w+|piso\s*\w+))?$/i.test(
+      input.trim(),
+    );
 
     const direccionHint =
-      /(av\.|avenida|calle|altura|nro|numero|#|\d{2,5})/.test(lowered) &&
-      /(calle|av\.|avenida|pasaje|ruta|corrientes|san martin|belgrano|siempre viva)/.test(
-        lowered);
+      hasAddressLikePattern ||
+      (/(av\.|avenida|calle|altura|nro|numero|#|\d{2,5})/.test(lowered) &&
+        /(calle|av\.|avenida|pasaje|ruta)/.test(lowered));
+
+    // Evita clasificar direcciones + DNI como "problema" solo por longitud.
+    const problemaHint = hasProblemKeywords || (input.length > 35 && !direccionHint);
 
     return {
       understood: Boolean(correoMatch || dniMatch || problemaHint || direccionHint),
