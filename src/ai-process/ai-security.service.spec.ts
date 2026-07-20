@@ -3,6 +3,11 @@ import { BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AiSecurityService } from './ai-security.service';
 import { RedisService } from '../redis/redis.service';
+import { InputLengthStrategy } from '../ai-security/strategies/input-length.strategy';
+import { PromptInjectionStrategy } from '../ai-security/strategies/prompt-injection.strategy';
+import { SensitiveAccessStrategy } from '../ai-security/strategies/sensitive-access.strategy';
+import { ClaimKeywordStrategy } from '../ai-security/strategies/claim-keyword.strategy';
+import { INPUT_SECURITY_STRATEGIES } from '../ai-security/strategies/input-security-strategy.interface';
 
 /**
  * Mock de Redis Client
@@ -40,6 +45,10 @@ const mockConfigService = {
 
 describe('AiSecurityService (con Redis)', () => {
   let service: AiSecurityService;
+  let inputLengthStrategy: InputLengthStrategy;
+  let promptInjectionStrategy: PromptInjectionStrategy;
+  let sensitiveAccessStrategy: SensitiveAccessStrategy;
+  let claimKeywordStrategy: ClaimKeywordStrategy;
 
   beforeEach(async () => {
     // Limpiar mocks
@@ -48,12 +57,56 @@ describe('AiSecurityService (con Redis)', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AiSecurityService,
+        InputLengthStrategy,
+        PromptInjectionStrategy,
+        SensitiveAccessStrategy,
+        ClaimKeywordStrategy,
+        {
+          provide: INPUT_SECURITY_STRATEGIES,
+          useFactory: (
+            lengthStrategy: InputLengthStrategy,
+            injectionStrategy: PromptInjectionStrategy,
+            sensitiveStrategy: SensitiveAccessStrategy,
+            keywordStrategy: ClaimKeywordStrategy,
+          ) => [
+            lengthStrategy,
+            injectionStrategy,
+            sensitiveStrategy,
+            keywordStrategy,
+          ],
+          inject: [
+            InputLengthStrategy,
+            PromptInjectionStrategy,
+            SensitiveAccessStrategy,
+            ClaimKeywordStrategy,
+          ],
+        },
         { provide: RedisService, useValue: mockRedisService },
         { provide: ConfigService, useValue: mockConfigService },
       ],
     }).compile();
 
     service = module.get<AiSecurityService>(AiSecurityService);
+    inputLengthStrategy = module.get<InputLengthStrategy>(InputLengthStrategy);
+    promptInjectionStrategy = module.get<PromptInjectionStrategy>(PromptInjectionStrategy);
+    sensitiveAccessStrategy = module.get<SensitiveAccessStrategy>(SensitiveAccessStrategy);
+    claimKeywordStrategy = module.get<ClaimKeywordStrategy>(ClaimKeywordStrategy);
+  });
+
+  describe('Orquestación de estrategias', () => {
+    it('should execute all input strategies from context', () => {
+      const lengthSpy = jest.spyOn(inputLengthStrategy, 'validate');
+      const injectionSpy = jest.spyOn(promptInjectionStrategy, 'validate');
+      const sensitiveSpy = jest.spyOn(sensitiveAccessStrategy, 'validate');
+      const claimSpy = jest.spyOn(claimKeywordStrategy, 'validate');
+
+      service.validateAndSanitizeInput('Hay un bache grande en avenida Siempre Viva 742');
+
+      expect(lengthSpy).toHaveBeenCalledTimes(1);
+      expect(injectionSpy).toHaveBeenCalledTimes(1);
+      expect(sensitiveSpy).toHaveBeenCalledTimes(1);
+      expect(claimSpy).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('Detección de Prompt Injection', () => {

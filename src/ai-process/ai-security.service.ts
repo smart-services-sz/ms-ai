@@ -1,6 +1,10 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { Inject, Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../redis/redis.service';
+import {
+  INPUT_SECURITY_STRATEGIES,
+  InputSecurityStrategy,
+} from '../ai-security/strategies/input-security-strategy.interface';
 
 /**
  * Servicio de seguridad para el agente de IA.
@@ -16,7 +20,6 @@ export class AiSecurityService {
   private readonly logger = new Logger(AiSecurityService.name);
   
   // Configuración de límites (desde env variables o defaults)
-  private readonly MAX_INPUT_LENGTH: number;
   private readonly MAX_REQUESTS_PER_MINUTE: number;
   private readonly MAX_REQUESTS_PER_HOUR: number;
   
@@ -24,59 +27,19 @@ export class AiSecurityService {
   private readonly RATE_LIMIT_MIN_PREFIX = 'ai:rate_limit:min:';
   private readonly RATE_LIMIT_HOUR_PREFIX = 'ai:rate_limit:hour:';
   
-  // Palabras clave y patrones sospechosos que sugieren prompt injection
-  private readonly INJECTION_PATTERNS = [
-    /ignore\s+(all|previous|instructions|system|rules)/gi,
-    /ignora/gi, // "ignora instrucciones", "ignora las reglas", etc
-    /olvid[ae]/gi, // "olvida todo", "olvide las reglas", etc
-    /forget\s+(all|previous|instructions|system|rules)/gi,
-    /system\s*:\s*/gi,
-    /you\s+are\s+now/gi,
-    /act\s+as\s+(?!un\s+asistente)/gi,
-    /actúa\s+como/gi,
-    /pretend\s+(?!to\s+be)/gi,
-    /role\s*play/gi,
-    /jailbreak/gi,
-    /bypass/gi,
-    /override/gi,
-    /administrator\s+mode/gi,
-    /modo\s+administrador/gi,
-    /developer\s+mode/gi,
-    /DAN\s+\d+/gi,
-    /\[SYSTEM_OVERRIDE\]/gi,
-    /\[UNRESTRICTED\]/gi,
-  ];
-  
-  // Palabras clave que indican que es realmente un reclamo válido
-  private readonly CLAIM_KEYWORDS = [
-    'reclamo', 'problema', 'fuga', 'corte', 'rotura', 'sin agua', 'sin luz',
-    'bache', 'basura', 'luminaria', 'poste', 'semáforo', 'árbol', 'gas',
-    'inundación', 'cloaca', 'dirección', 'ubicación', 'calle', 'avenida',
-    'teléfono', 'email', 'correo', 'dni', 'cédula', 'emergencia', 'urgente',
-    'solicito', 'request', 'reportar', 'denunciar'
-  ];
-  
-  // Palabras clave que sugieren intento de obtener información sensible
-  private readonly SENSITIVE_REQUESTS = [
-    'contraseña', 'password', 'clave', 'api_key', 'token', 'secret',
-    'base de datos', 'database', 'credential', 'config', 'configuración',
-    'usuario', 'admin', 'administrador', 'directorio', 'archivo',
-    'hacker', 'exploit', 'vulnerabilidad', 'sql injection', 'xss'
-  ];
-
   constructor(
     private readonly redisService: RedisService,
     private readonly configService: ConfigService,
+    @Inject(INPUT_SECURITY_STRATEGIES)
+    private readonly inputSecurityStrategies: InputSecurityStrategy[],
   ) {
-    this.MAX_INPUT_LENGTH =
-      this.configService.get<number>('AI_MAX_INPUT_LENGTH') || 2000;
     this.MAX_REQUESTS_PER_MINUTE =
       this.configService.get<number>('AI_RATE_LIMIT_PER_MIN') || 100;
     this.MAX_REQUESTS_PER_HOUR =
       this.configService.get<number>('AI_RATE_LIMIT_PER_HOUR') || 1000;
 
     this.logger.log(
-      `AiSecurityService configurado: MaxInput=${this.MAX_INPUT_LENGTH}, RateLimitMin=${this.MAX_REQUESTS_PER_MINUTE}, RateLimitHour=${this.MAX_REQUESTS_PER_HOUR}`,
+      `AiSecurityService configurado: strategies=${this.inputSecurityStrategies.length}, RateLimitMin=${this.MAX_REQUESTS_PER_MINUTE}, RateLimitHour=${this.MAX_REQUESTS_PER_HOUR}`,
     );
   }
 
@@ -85,59 +48,17 @@ export class AiSecurityService {
    * Retorna la entrada limpia o lanza BadRequestException si es sospechosa.
    */
   validateAndSanitizeInput(input: string, clientId?: string): string {
-    if (!input || typeof input !== 'string') {
+    if (input === null || input === undefined || typeof input !== 'string') {
       throw new BadRequestException('Input inválido o vacío');
     }
 
     const trimmed = input.trim();
 
-    // Verificar longitud
-    if (trimmed.length > this.MAX_INPUT_LENGTH) {
-      this.logger.warn(
-        `Input rechazado por longitud excesiva: ${trimmed.length} caracteres (máximo: ${this.MAX_INPUT_LENGTH}) | clientId=${clientId}`,
-      );
-      throw new BadRequestException(
-        `Mensaje demasiado largo. Máximo ${this.MAX_INPUT_LENGTH} caracteres.`,
-      );
+    for (const strategy of this.inputSecurityStrategies) {
+      strategy.validate(trimmed, clientId);
     }
 
-    // Verificar patrones de inyección
-    if (this.detectInjectionPatterns(trimmed)) {
-      this.logger.warn(
-        `Intento de prompt injection detectado: "${trimmed.substring(0, 100)}" | clientId=${clientId}`,
-      );
-      throw new BadRequestException(
-        'Solicitud rechazada por validación de seguridad.',
-      );
-    }
-
-    // Verificar intentos de acceso a información sensible
-    if (this.detectSensitiveAccess(trimmed)) {
-      this.logger.warn(
-        `Intento de acceso a información sensible: "${trimmed.substring(0, 100)}" | clientId=${clientId}`,
-      );
-      throw new BadRequestException(
-        'Solicitud rechazada por validación de seguridad.',
-      );
-    }
-
-    // Verificar que haya mínimalmente señales de reclamo válidas
-    // (permisivo: 20+ caracteres, keyword de reclamo, o patrón de dirección)
-    if (
-      trimmed.length > 20 ||
-      this.hasClaimKeywords(trimmed) ||
-      this.hasAddressLikePattern(trimmed)
-    ) {
-      return trimmed;
-    }
-
-    // Si no tiene palabras clave y es muy corto, rechazar
-    this.logger.warn(
-      `Input demasiado corto sin keywords de reclamo: "${trimmed}" | clientId=${clientId}`,
-    );
-    throw new BadRequestException(
-      'Por favor describe tu reclamo con más detalle.',
-    );
+    return trimmed;
   }
 
   /**
@@ -195,34 +116,38 @@ export class AiSecurityService {
    * Valida la respuesta de OpenAI para asegurar que es coherente
    * y no contiene respuestas a prompts inyectados.
    */
-  validateAiResponse(
-    response: Record<string, unknown>,
-    originalInput: string,
-  ): boolean {
+  validateAiResponse(response: unknown, _originalInput?: string): boolean {
+    if (!response || typeof response !== 'object') {
+      this.logger.warn('Respuesta AI inválida: se esperaba un objeto');
+      return false;
+    }
+
+    const aiResponse = response as Record<string, unknown>;
+
     // Verificar que la respuesta tenga la estructura esperada
-    if (typeof response.understood !== 'boolean') {
+    if (typeof aiResponse.understood !== 'boolean') {
       this.logger.warn('Respuesta AI sin campo "understood" válido');
       return false;
     }
 
     if (
-      typeof response.confidence !== 'number' ||
-      response.confidence < 0 ||
-      response.confidence > 1
+      typeof aiResponse.confidence !== 'number' ||
+      aiResponse.confidence < 0 ||
+      aiResponse.confidence > 1
     ) {
       this.logger.warn('Respuesta AI con "confidence" inválido');
       return false;
     }
 
     // Si understood es false, otros campos deben estar vacíos
-    if (!response.understood) {
+    if (!aiResponse.understood) {
       const hasData =
-        response.correo || 
-        response.dni || 
-        response.problema || 
-        response.direccion ||
-        response.categoria ||
-        response.prioridad;
+        aiResponse.correo || 
+        aiResponse.dni || 
+        aiResponse.problema || 
+        aiResponse.direccion ||
+        aiResponse.categoria ||
+        aiResponse.prioridad;
       
       if (hasData) {
         this.logger.warn(
@@ -238,15 +163,15 @@ export class AiSecurityService {
       'residuos', 'electricidad', 'gas', 'transporte', 'infraestructura',
       'otros'
     ];
-    if (response.categoria && !validCategories.includes(response.categoria as string)) {
-      this.logger.warn(`Categoría inválida detectada: ${response.categoria}`);
+    if (aiResponse.categoria && !validCategories.includes(aiResponse.categoria as string)) {
+      this.logger.warn(`Categoría inválida detectada: ${aiResponse.categoria}`);
       return false;
     }
 
     // Validar que la prioridad está en el conjunto permitido
     const validPriorities = ['alta', 'media', 'baja'];
-    if (response.prioridad && !validPriorities.includes(response.prioridad as string)) {
-      this.logger.warn(`Prioridad inválida detectada: ${response.prioridad}`);
+    if (aiResponse.prioridad && !validPriorities.includes(aiResponse.prioridad as string)) {
+      this.logger.warn(`Prioridad inválida detectada: ${aiResponse.prioridad}`);
       return false;
     }
 
@@ -323,66 +248,4 @@ export class AiSecurityService {
     }
   }
 
-  /**
-   * Detecta patrones conocidos de inyección de prompts
-   */
-  private detectInjectionPatterns(input: string): boolean {
-    for (const pattern of this.INJECTION_PATTERNS) {
-      if (pattern.test(input)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Detecta intentos de acceso a información sensible
-   */
-  private detectSensitiveAccess(input: string): boolean {
-    const lowerInput = input.toLowerCase();
-    for (const keyword of this.SENSITIVE_REQUESTS) {
-      if (lowerInput.includes(keyword)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Verifica si el input contiene palabras clave de reclamos válidos
-   */
-  private hasClaimKeywords(input: string): boolean {
-    const lowerInput = input.toLowerCase();
-    for (const keyword of this.CLAIM_KEYWORDS) {
-      if (lowerInput.includes(keyword)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Heurística para aceptar direcciones breves válidas
-   * (ej: "montevideo 1963", "av pellegrini 1200").
-   */
-  private hasAddressLikePattern(input: string): boolean {
-    const normalized = input.trim().toLowerCase();
-
-    // Requiere letras y números para evitar aceptar ruido como "123" o "hola".
-    const hasLetters = /[a-záéíóúñ]/i.test(normalized);
-    const hasDigits = /\d/.test(normalized);
-
-    if (!hasLetters || !hasDigits) {
-      return false;
-    }
-
-    // Mínimo de longitud para evitar falsos positivos triviales.
-    if (normalized.length < 8) {
-      return false;
-    }
-
-    // Patrones comunes de calle + numeración.
-    const addressRegex = /(?:\b(?:calle|av\.?|avenida|pasaje|pje\.?|ruta|boulevard|blvd\.?|diag\.?|diagonal)\b\s+)?[a-záéíóúñ][a-záéíóúñ\s'.-]{2,}\s+\d{1,5}(?:\s*(?:bis|dpto\.?\s*\w+|depto\.?\s*\w+|piso\s*\w+))?$/i;
-    return addressRegex.test(normalized);
-  }
 }
