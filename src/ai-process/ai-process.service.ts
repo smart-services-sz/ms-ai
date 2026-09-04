@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { AiInboundPayloadDto } from './dto/ai-inbound-payload.dto';
+import { AiInboundPayloadDto, ChannelType } from './dto/ai-inbound-payload.dto';
 import {
   ConversationState,
   ConversationPhase,
@@ -52,7 +52,26 @@ export class AiProcessService {
 
     const effectiveState = currentState.greeted
       ? currentState
-      : { ...currentState, phase: 'awaiting_identity_and_claim' as ConversationPhase };
+      : {
+          ...currentState,
+          phase: 'awaiting_identity_and_claim' as ConversationPhase,
+        };
+
+    if (
+      payload.channel === ChannelType.WHATSAPP &&
+      typeof this.support.isCitizenResponseRequest === 'function' &&
+      this.support.isCitizenResponseRequest(payload.consolidatedText)
+    ) {
+      return this.processCitizenResponse(payload, effectiveState);
+    }
+
+    if (
+      payload.channel === ChannelType.WHATSAPP &&
+      typeof this.support.isTrackingRequest === 'function' &&
+      this.support.isTrackingRequest(payload.consolidatedText)
+    ) {
+      return this.processTrackingRequest(payload, effectiveState);
+    }
 
     const handler = this.stateHandlers.find((stateHandler) =>
       stateHandler.canHandle(effectiveState.phase),
@@ -66,6 +85,115 @@ export class AiProcessService {
     await this.saveConversationState(state);
 
     return response;
+  }
+
+  private async processTrackingRequest(
+    payload: AiInboundPayloadDto,
+    state: ConversationState,
+  ) {
+    const trackingCode = this.support.extractTrackingCode(
+      payload.consolidatedText,
+    );
+    if (!trackingCode) {
+      return {
+        status: 'tracking_invalid',
+        assistantMessage: 'No pude identificar el código de seguimiento.',
+        state,
+      };
+    }
+
+    const result = await this.support.getPublicTracking(
+      trackingCode,
+      payload.contactKey,
+    );
+    const assistantMessage = result.data
+      ? `El reclamo ${result.data.trackingCode} se encuentra ${this.publicStatusLabel(result.data.status)}. Última actualización: ${new Date(result.data.updatedAt).toLocaleDateString('es-AR')}.`
+      : 'No encontré un reclamo asociado a ese código y a este contacto.';
+
+    const nextState = this.support.appendAsistente(
+      {
+        ...state,
+        mensajes: [
+          ...(state.mensajes || []),
+          this.support.makeMensaje('usuario', payload.consolidatedText),
+        ],
+      },
+      assistantMessage,
+    );
+
+    return {
+      correlationId: payload.correlationId,
+      contactKey: payload.contactKey,
+      status: result.data ? 'tracking_found' : 'tracking_not_found',
+      shouldAskAgain: false,
+      assistantMessage,
+      state: nextState,
+    };
+  }
+
+  private async processCitizenResponse(
+    payload: AiInboundPayloadDto,
+    state: ConversationState,
+  ) {
+    const trackingCode = this.support.extractTrackingCode(
+      payload.consolidatedText,
+    );
+    const type = this.support.citizenResponseType(payload.consolidatedText);
+    const tracking = trackingCode
+      ? await this.support.getPublicTracking(trackingCode, payload.contactKey)
+      : { status: 'not_found', data: null };
+
+    if (!tracking.data) {
+      return {
+        correlationId: payload.correlationId,
+        contactKey: payload.contactKey,
+        status: 'citizen_response_not_found',
+        shouldAskAgain: false,
+        assistantMessage: 'No pude validar ese reclamo con este contacto.',
+        state,
+      };
+    }
+
+    if (type === 'disconforme' && tracking.data.status === 'cerrado') {
+      await this.support.reopenCitizen(
+        trackingCode!,
+        payload.contactKey,
+        payload.consolidatedText,
+      );
+    } else {
+      await this.support.submitCitizenResponse(
+        tracking.data.claimId,
+        type,
+        payload.contactKey,
+        payload.consolidatedText,
+      );
+    }
+
+    const assistantMessage =
+      type === 'confirmada'
+        ? 'Gracias por confirmar la resolución de tu reclamo.'
+        : 'Registramos tu disconformidad y mantendremos el reclamo en seguimiento.';
+    const nextState = this.support.appendAsistente(state, assistantMessage);
+    return {
+      correlationId: payload.correlationId,
+      contactKey: payload.contactKey,
+      status:
+        type === 'confirmada' ? 'citizen_response_recorded' : 'claim_reopened',
+      shouldAskAgain: false,
+      assistantMessage,
+      state: nextState,
+    };
+  }
+
+  private publicStatusLabel(status: string): string {
+    const labels: Record<string, string> = {
+      pendiente: 'pendiente',
+      en_proceso: 'en proceso',
+      resuelto: 'resuelto',
+      rechazado: 'rechazado',
+      cerrado: 'cerrado',
+    };
+    return labels[status] || 'en proceso';
   }
 
   private buildInitialState(contactKey: string): ConversationState {

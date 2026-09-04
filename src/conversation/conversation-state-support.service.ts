@@ -4,7 +4,10 @@ import { ConfigService } from '@nestjs/config';
 import { firstValueFrom, timeout } from 'rxjs';
 import { AiInboundPayloadDto } from '../ai-process/dto/ai-inbound-payload.dto';
 import { AiInterpreterService } from '../ai-process/ai-interpreter.service';
-import { ConversationState, MensajeEntry } from '../ai-process/types/conversation-state.type';
+import {
+  ConversationState,
+  MensajeEntry,
+} from '../ai-process/types/conversation-state.type';
 
 export type GeocodeResponse = {
   correlationId: string;
@@ -62,6 +65,90 @@ export class ConversationStateSupportService {
     return this.aiInterpreterService.parseClaimText(input, clientId);
   }
 
+  async getPublicTracking(codigoSeguimiento: string, contactKey: string) {
+    return firstValueFrom(
+      this.natsClient
+        .send<{
+          status: 'ok' | 'not_found';
+          data: {
+            claimId: string;
+            trackingCode: string;
+            status: string;
+            category: string;
+            updatedAt: string;
+          } | null;
+        }>('reclamos.public-tracking', {
+          codigoSeguimiento,
+          contactKey,
+        })
+        .pipe(timeout(8000)),
+    );
+  }
+
+  extractTrackingCode(text: string): string | undefined {
+    return text.match(/\bREC-[A-Z0-9]+\b/i)?.[0].toUpperCase();
+  }
+
+  isTrackingRequest(text: string): boolean {
+    const normalized = text.toLowerCase();
+    return (
+      Boolean(this.extractTrackingCode(text)) &&
+      /(estado|seguimiento|reclamo|como esta|cómo está)/.test(normalized)
+    );
+  }
+
+  isCitizenResponseRequest(text: string): boolean {
+    const normalized = text.toLowerCase();
+    return (
+      Boolean(this.extractTrackingCode(text)) &&
+      /(conforme|disconforme|satisfecho|satisfecha|no estoy conforme|no se resolvio|no se resolvió|reabrir)/.test(
+        normalized,
+      )
+    );
+  }
+
+  citizenResponseType(text: string): 'confirmada' | 'disconforme' {
+    return /(disconforme|no estoy conforme|no se resolvio|no se resolvió|reabrir)/.test(
+      text.toLowerCase(),
+    )
+      ? 'disconforme'
+      : 'confirmada';
+  }
+
+  async submitCitizenResponse(
+    claimId: string,
+    type: 'confirmada' | 'disconforme',
+    contactKey: string,
+    comentario?: string,
+  ): Promise<{ status: string; data?: unknown }> {
+    return firstValueFrom(
+      this.natsClient
+        .send<{ status: string; data?: unknown }>('reclamos.citizen.response', {
+          reclamoId: claimId,
+          tipo: type,
+          contactKey,
+          comentario,
+        })
+        .pipe(timeout(8000)),
+    );
+  }
+
+  async reopenCitizen(
+    trackingCode: string,
+    contactKey: string,
+    motivo: string,
+  ): Promise<{ status: string; data?: unknown }> {
+    return firstValueFrom(
+      this.natsClient
+        .send<{ status: string; data?: unknown }>('reclamos.citizen.reopen', {
+          trackingCode,
+          contactKey,
+          motivo,
+        })
+        .pipe(timeout(8000)),
+    );
+  }
+
   makeMensaje(origen: 'usuario' | 'asistente', texto: string): MensajeEntry {
     return { origen, texto, creadoEn: new Date().toISOString() };
   }
@@ -69,7 +156,10 @@ export class ConversationStateSupportService {
   appendAsistente(state: ConversationState, texto: string): ConversationState {
     return {
       ...state,
-      mensajes: [...(state.mensajes || []), this.makeMensaje('asistente', texto)],
+      mensajes: [
+        ...(state.mensajes || []),
+        this.makeMensaje('asistente', texto),
+      ],
       updatedAt: new Date().toISOString(),
     };
   }
@@ -97,7 +187,11 @@ export class ConversationStateSupportService {
   shouldRestartAfterClosure(text: string): boolean {
     const normalized = text.toLowerCase();
 
-    if (/\b(nuevo\s+reclamo|otro\s+reclamo|iniciar\s+reclamo|abrir\s+reclamo)\b/.test(normalized)) {
+    if (
+      /\b(nuevo\s+reclamo|otro\s+reclamo|iniciar\s+reclamo|abrir\s+reclamo)\b/.test(
+        normalized,
+      )
+    ) {
       return true;
     }
 
@@ -105,9 +199,13 @@ export class ConversationStateSupportService {
       /\b\d{7,8}\b/.test(normalized) ||
       /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/.test(normalized);
     const hasAddressLike =
-      /\b(calle|av\.?|avenida|pasaje|ruta|nro|numero|altura|\d{3,5})\b/.test(normalized);
+      /\b(calle|av\.?|avenida|pasaje|ruta|nro|numero|altura|\d{3,5})\b/.test(
+        normalized,
+      );
     const hasProblemLike =
-      /\b(sin\s+luz|sin\s+agua|corte|fuga|rotura|bache|reclamo|problema)\b/.test(normalized);
+      /\b(sin\s+luz|sin\s+agua|corte|fuga|rotura|bache|reclamo|problema)\b/.test(
+        normalized,
+      );
 
     return hasIdentity && hasAddressLike && hasProblemLike;
   }
@@ -136,9 +234,13 @@ export class ConversationStateSupportService {
       /\b\d{7,8}\b/.test(normalized) ||
       /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/.test(normalized);
     const hasAddressLike =
-      /\b(calle|av\.?|avenida|pasaje|ruta|nro|numero|altura|\d{3,5})\b/.test(normalized);
+      /\b(calle|av\.?|avenida|pasaje|ruta|nro|numero|altura|\d{3,5})\b/.test(
+        normalized,
+      );
     const hasProblemLike =
-      /\b(sin\s+luz|sin\s+agua|corte|fuga|rotura|bache|reclamo|problema)\b/.test(normalized);
+      /\b(sin\s+luz|sin\s+agua|corte|fuga|rotura|bache|reclamo|problema)\b/.test(
+        normalized,
+      );
 
     return !hasIdentity && !hasAddressLike && !hasProblemLike;
   }
@@ -152,7 +254,10 @@ export class ConversationStateSupportService {
   }
 
   getAllowedAreasLabel(): string {
-    return this.configService.get<string>('GEO_ALLOWED_ADMIN_AREAS', 'la zona de cobertura');
+    return this.configService.get<string>(
+      'GEO_ALLOWED_ADMIN_AREAS',
+      'la zona de cobertura',
+    );
   }
 
   async createClaim(
@@ -171,7 +276,10 @@ export class ConversationStateSupportService {
       const geocode = await this.geocodeAddress(payload, state.direccion);
 
       if (!geocode || !geocode.data) {
-        return { success: false, error: 'No hubo respuesta valida de geolocalizacion' };
+        return {
+          success: false,
+          error: 'No hubo respuesta valida de geolocalizacion',
+        };
       }
 
       if (!this.isWithinServiceArea(geocode)) {
@@ -196,6 +304,12 @@ export class ConversationStateSupportService {
             lng: geocode.data.lng,
             categoria: state.categoria || 'otros',
             prioridad: state.prioridad || 'media',
+            municipalityId: this.toTerritoryId(
+              geocode.data.addressComponents?.locality,
+            ),
+            areaId: this.toTerritoryId(
+              geocode.data.addressComponents?.adminArea,
+            ),
             mensajes: state.mensajes || [],
             metadata: {
               geocodeStatus: geocode.status,
@@ -213,7 +327,9 @@ export class ConversationStateSupportService {
       return { success: true, reclamo };
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      this.logger.error(`[${payload.correlationId}] Error creando reclamo: ${message}`);
+      this.logger.error(
+        `[${payload.correlationId}] Error creando reclamo: ${message}`,
+      );
       return { success: false, error: message };
     }
   }
@@ -222,7 +338,10 @@ export class ConversationStateSupportService {
     payload: AiInboundPayloadDto,
     address: string,
   ): Promise<GeocodeResponse> {
-    const country = this.configService.get<string>('GEO_DEFAULT_COUNTRY', 'Argentina');
+    const country = this.configService.get<string>(
+      'GEO_DEFAULT_COUNTRY',
+      'Argentina',
+    );
     const city = this.resolveCityHint(address);
 
     const requestPayload: GeocodeRequestPayload = {
@@ -239,6 +358,18 @@ export class ConversationStateSupportService {
     );
   }
 
+  private toTerritoryId(value?: string | null): string | undefined {
+    const normalized = value
+      ?.trim()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+
+    return normalized || undefined;
+  }
+
   private resolveCityHint(address: string): string | undefined {
     const normalizedAddress = address.toLowerCase();
     const allowedTokens = this.getAllowedAreaTokens();
@@ -250,7 +381,9 @@ export class ConversationStateSupportService {
       return undefined;
     }
 
-    const configuredCity = this.configService.get<string>('GEO_DEFAULT_CITY')?.trim();
+    const configuredCity = this.configService
+      .get<string>('GEO_DEFAULT_CITY')
+      ?.trim();
     if (configuredCity) {
       return configuredCity;
     }
@@ -280,7 +413,11 @@ export class ConversationStateSupportService {
     const adminArea = (components.adminArea || '').toLowerCase();
     const locality = (components.locality || '').toLowerCase();
 
-    if (allowedCountries.length && country && !allowedCountries.includes(country)) {
+    if (
+      allowedCountries.length &&
+      country &&
+      !allowedCountries.includes(country)
+    ) {
       return false;
     }
 
@@ -293,7 +430,8 @@ export class ConversationStateSupportService {
 
       const matchesScope = allowedAdminAreas.some((allowed) =>
         scopeCandidates.some(
-          (candidate) => candidate.includes(allowed) || allowed.includes(candidate),
+          (candidate) =>
+            candidate.includes(allowed) || allowed.includes(candidate),
         ),
       );
 
