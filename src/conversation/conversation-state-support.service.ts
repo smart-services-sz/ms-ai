@@ -51,6 +51,11 @@ export type CreateReclamoResponse = {
   };
 };
 
+export type CitizenFollowupResult = {
+  status: string;
+  assistantMessage: string;
+};
+
 @Injectable()
 export class ConversationStateSupportService {
   private readonly logger = new Logger(ConversationStateSupportService.name);
@@ -66,12 +71,13 @@ export class ConversationStateSupportService {
   }
 
   async getPublicTracking(codigoSeguimiento: string, contactKey: string) {
+    const contacto = this.contactFromKey(contactKey);
+    if (!contacto) return { status: 'not_found' as const, data: null };
     return firstValueFrom(
       this.natsClient
         .send<{
           status: 'ok' | 'not_found';
           data: {
-            claimId: string;
             trackingCode: string;
             status: string;
             category: string;
@@ -79,10 +85,101 @@ export class ConversationStateSupportService {
           } | null;
         }>('reclamos.public-tracking', {
           codigoSeguimiento,
-          contactKey,
+          contacto,
         })
         .pipe(timeout(8000)),
     );
+  }
+
+  async handleCitizenFollowup(
+    payload: AiInboundPayloadDto,
+  ): Promise<CitizenFollowupResult | null> {
+    if (payload.channel !== 'whatsapp') return null;
+
+    const text = payload.consolidatedText.trim();
+    const trackingCode = this.extractTrackingCode(text);
+    if (!trackingCode) return null;
+
+    if (this.isCitizenResponseRequest(text)) {
+      const tracking = await this.getPublicTracking(
+        trackingCode,
+        payload.contactKey,
+      );
+      if (tracking.status !== 'ok' || !tracking.data) {
+        return {
+          status: 'citizen_response_not_found',
+          assistantMessage:
+            'No pude validar ese reclamo con este contacto.',
+        };
+      }
+
+      const type = this.citizenResponseType(text);
+      const shouldReopen =
+        /\breabrir\b/i.test(text) ||
+        (type === 'disconforme' && tracking.data.status === 'cerrado');
+      if (shouldReopen) {
+        const response = await this.reopenCitizen(
+          trackingCode,
+          payload.contactKey,
+          this.extractCitizenComment(text, trackingCode) ||
+            'El ciudadano solicito reabrir el reclamo por WhatsApp.',
+        );
+        if (response.status !== 'ok') {
+          return {
+            status: 'citizen_response_not_found',
+            assistantMessage:
+              'No pude validar ese reclamo con este contacto.',
+          };
+        }
+        return {
+          status: 'claim_reopened',
+          assistantMessage:
+            `Registramos la solicitud de reapertura del reclamo ${trackingCode}. El municipio continuara su seguimiento.`,
+        };
+      }
+
+      const response = await this.submitCitizenResponse(
+        trackingCode,
+        type,
+        payload.contactKey,
+        this.extractCitizenComment(text, trackingCode),
+      );
+      if (response.status !== 'ok') {
+        return {
+          status: 'citizen_response_not_found',
+          assistantMessage:
+            'No pude validar ese reclamo con este contacto.',
+        };
+      }
+      return {
+        status: 'citizen_response_recorded',
+        assistantMessage:
+          type === 'confirmada'
+            ? `Gracias por confirmar la resolucion del reclamo ${trackingCode}. Registramos tu respuesta.`
+            : `Registramos tu disconformidad con el reclamo ${trackingCode}. El municipio continuara el seguimiento.`,
+      };
+    }
+
+    if (this.isTrackingRequest(text)) {
+      const tracking = await this.getPublicTracking(
+        trackingCode,
+        payload.contactKey,
+      );
+      if (tracking.status !== 'ok' || !tracking.data) {
+        return {
+          status: 'tracking_not_found',
+          assistantMessage:
+            'No encontre un reclamo asociado a ese codigo y a este contacto.',
+        };
+      }
+      return {
+        status: 'tracking_found',
+        assistantMessage:
+          `El reclamo ${tracking.data.trackingCode} se encuentra ${this.publicStatusLabel(tracking.data.status)}. Categoria: ${tracking.data.category}. Ultima actualizacion: ${new Date(tracking.data.updatedAt).toLocaleDateString('es-AR')}.`,
+      };
+    }
+
+    return null;
   }
 
   extractTrackingCode(text: string): string | undefined {
@@ -115,8 +212,39 @@ export class ConversationStateSupportService {
       : 'confirmada';
   }
 
+  private contactFromKey(contactKey: string): string | undefined {
+    const [, identityType, ...identityParts] = contactKey.split(':');
+    const value = identityParts.join(':');
+    if (identityType === 'phone') return value.replace(/\D/g, '') || undefined;
+    if (identityType === 'email') return value.trim().toLowerCase() || undefined;
+    return undefined;
+  }
+
+  private extractCitizenComment(
+    text: string,
+    trackingCode: string,
+  ): string | undefined {
+    const normalized = text
+      .replace(trackingCode, '')
+      .replace(/\b(CONFORME|DISCONFORME|REABRIR|SATISFECHO|SATISFECHA)\b/i, '')
+      .replace(/^\s*[:,-]+\s*/, '')
+      .trim();
+    return normalized || undefined;
+  }
+
+  private publicStatusLabel(status: string): string {
+    const labels: Record<string, string> = {
+      pendiente: 'pendiente',
+      en_proceso: 'en proceso',
+      resuelto: 'resuelto',
+      rechazado: 'rechazado',
+      cerrado: 'cerrado',
+    };
+    return labels[status] || 'en seguimiento';
+  }
+
   async submitCitizenResponse(
-    claimId: string,
+    trackingCode: string,
     type: 'confirmada' | 'disconforme',
     contactKey: string,
     comentario?: string,
@@ -124,7 +252,7 @@ export class ConversationStateSupportService {
     return firstValueFrom(
       this.natsClient
         .send<{ status: string; data?: unknown }>('reclamos.citizen.response', {
-          reclamoId: claimId,
+          trackingCode,
           tipo: type,
           contactKey,
           comentario,
