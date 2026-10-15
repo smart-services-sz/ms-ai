@@ -24,6 +24,29 @@ describe('ConversationStateSupportService citizen followup', () => {
 
   let natsClient: { send: jest.Mock };
   let service: ConversationStateSupportService;
+  let config: { get: jest.Mock };
+  const municipality = {
+    id: 'funes', name: 'Municipalidad de Funes', defaultCity: 'Funes',
+    country: 'Argentina', isActive: true,
+    allowedCountries: ['Argentina'], allowedAdminAreas: ['Santa Fe'],
+    categories: [
+      { code: 'alumbrado', isActive: true, defaultPriority: 'alta' },
+      { code: 'baches_y_pavimento', isActive: true, defaultPriority: 'media' },
+    ],
+  };
+  const claimState = () => ({
+    contactKey: payload('').contactKey, phase: 'collecting_claim_data' as const,
+    greeted: true, correo: 'citizen@example.com', problema: 'Luminaria apagada',
+    direccion: 'San Martin 123', categoria: 'alumbrado' as const,
+    prioridad: 'media' as const, mensajes: [], updatedAt: new Date().toISOString(),
+  });
+  const geocode = {
+    status: 'geocode_ok', data: {
+      lat: -32.91, lng: -60.81, formattedAddress: 'San Martin 123, Funes',
+      provider: 'google-geocoding',
+      addressComponents: { country: 'Argentina', adminArea: 'Santa Fe', locality: 'Funes' },
+    },
+  };
 
   beforeEach(() => {
     natsClient = {
@@ -31,9 +54,10 @@ describe('ConversationStateSupportService citizen followup', () => {
         of({ status: 'ok', data: { trackingCode: 'REC-ABC123', status: 'resuelto', category: 'alumbrado', updatedAt: '2026-10-14T12:00:00.000Z' } }),
       ),
     };
+    config = { get: jest.fn((key: string, fallback?: string) => key === 'AI_MUNICIPALITY_ID' ? 'funes' : fallback) };
     service = new ConversationStateSupportService(
       {} as AiInterpreterService,
-      { get: jest.fn((_key: string, fallback?: string) => fallback) } as unknown as ConfigService,
+      config as unknown as ConfigService,
       natsClient as never,
     );
   });
@@ -144,6 +168,66 @@ describe('ConversationStateSupportService citizen followup', () => {
     expect(natsClient.send).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { ...municipality, isActive: false },
+    { ...municipality, id: 'otro_municipio' },
+    { ...municipality, categories: [] },
+    { ...municipality, categories: [{ ...municipality.categories[0], isActive: false }] },
+  ])('blocks unconfigured, inactive or mismatched catalogs/categories', async (configuration) => {
+    natsClient.send.mockReturnValue(of(configuration));
+    await expect(service.createClaim(payload(''), claimState())).resolves.toMatchObject({ success: false });
+    expect(natsClient.send).toHaveBeenCalledTimes(1);
+    expect(natsClient.send).not.toHaveBeenCalledWith('reclamos.create', expect.anything());
+  });
+
+  it('blocks creation when no municipality is bound to the channel', async () => {
+    config.get.mockReturnValue(undefined);
+    await expect(service.createClaim(payload(''), claimState())).resolves.toMatchObject({ success: false });
+    expect(natsClient.send).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the municipal catalog is unavailable', async () => {
+    natsClient.send.mockImplementation(() => { throw new Error('catalog unavailable'); });
+    await expect(service.createClaim(payload(''), claimState())).resolves.toMatchObject({ success: false });
+    expect(natsClient.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { ...geocode, status: 'geocode_not_found' },
+    { ...geocode, data: { ...geocode.data, lat: 91 } },
+    { ...geocode, data: { ...geocode.data, addressComponents: undefined } },
+    { ...geocode, data: { ...geocode.data, addressComponents: { ...geocode.data.addressComponents, locality: 'Rosario' } } },
+    { ...geocode, data: { ...geocode.data, addressComponents: { ...geocode.data.addressComponents, country: 'Uruguay' } } },
+    { ...geocode, data: { ...geocode.data, addressComponents: { ...geocode.data.addressComponents, adminArea: 'Buenos Aires' } } },
+    { ...geocode, data: { ...geocode.data, addressComponents: { ...geocode.data.addressComponents, country: null } } },
+  ])('rejects invalid or out-of-coverage geocoding: %j', async (response) => {
+    natsClient.send.mockImplementation((pattern: string) => of(
+      pattern === 'municipalities.config.get' ? municipality : response,
+    ));
+    await expect(service.createClaim(payload(''), claimState())).resolves.toMatchObject({
+      success: false, addressOutOfServiceArea: true, serviceArea: 'Funes',
+    });
+    expect(natsClient.send).toHaveBeenCalledTimes(2);
+    expect(natsClient.send).not.toHaveBeenCalledWith('reclamos.create', expect.anything());
+  });
+
+  it('uses the bound catalog ID rather than deriving it from locality or citizen metadata', async () => {
+    config.get.mockReturnValue('municipio_piloto');
+    natsClient.send.mockImplementation((pattern: string) => {
+      if (pattern === 'municipalities.config.get') return of({ ...municipality, id: 'municipio_piloto' });
+      if (pattern === 'geo.geocode-address') return of(geocode);
+      if (pattern === 'reclamos.find-all') return of({ items: [] });
+      return of({ reclamoId: 'new-claim-id', trackingCode: 'REC-NEW123' });
+    });
+    await expect(service.createClaim({ ...payload(''), metadata: { municipalityId: 'otro' } }, claimState()))
+      .resolves.toMatchObject({ success: true });
+    expect(natsClient.send).toHaveBeenCalledWith('municipalities.config.get', {
+      data: { id: 'municipio_piloto' }, context: { userId: 'ms-ai', ip: '' },
+    });
+    expect(natsClient.send).toHaveBeenCalledWith('geo.geocode-address', expect.objectContaining({ city: 'Funes', country: 'Argentina' }));
+    expect(natsClient.send).toHaveBeenCalledWith('reclamos.create', expect.objectContaining({ municipalityId: 'municipio_piloto', prioridad: 'alta' }));
+  });
+
   it('stores nearby same-category open claims as suggestions without blocking creation', async () => {
     const existingClaim = {
       id: 'existing-claim-id',
@@ -156,6 +240,7 @@ describe('ConversationStateSupportService citizen followup', () => {
       estado: 'pendiente',
     };
     natsClient.send.mockImplementation((pattern: string, request: { estado?: string }) => {
+      if (pattern === 'municipalities.config.get') return of(municipality);
       if (pattern === 'geo.geocode-address') {
         return of({
           status: 'geocode_ok',
@@ -223,6 +308,8 @@ describe('ConversationStateSupportService citizen followup', () => {
     const createCall = natsClient.send.mock.calls.find(
       ([pattern]) => pattern === 'reclamos.create',
     );
+    expect(createCall?.[1]).toMatchObject({ municipalityId: 'funes', prioridad: 'alta' });
+    expect(createCall?.[1]).not.toHaveProperty('areaId');
     expect(createCall?.[1].metadata.posiblesDuplicados).toEqual([
       expect.objectContaining({
         reclamoId: 'existing-claim-id',
@@ -248,6 +335,7 @@ describe('ConversationStateSupportService citizen followup', () => {
 
   it('continues claim creation if duplicate lookup is unavailable', async () => {
     natsClient.send.mockImplementation((pattern: string) => {
+      if (pattern === 'municipalities.config.get') return of(municipality);
       if (pattern === 'geo.geocode-address') {
         return of({
           status: 'geocode_ok',

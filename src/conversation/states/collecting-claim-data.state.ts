@@ -130,7 +130,7 @@ export class CollectingClaimDataState implements ConversationStateHandler {
 
     if (!claimCreation.success) {
       if ('addressOutOfServiceArea' in claimCreation && claimCreation.addressOutOfServiceArea) {
-        const oosMessage = `La direccion proporcionada no corresponde a nuestra zona de cobertura (${this.support.getAllowedAreasLabel()}). Por favor, indica una direccion dentro del area de servicio.`;
+        const oosMessage = `La direccion proporcionada no corresponde a nuestra zona de cobertura (${claimCreation.serviceArea}). Por favor, indica una direccion dentro del area de servicio.`;
         const oosState: ConversationState = this.support.appendAsistente(
           { ...mergedState, direccion: undefined },
           oosMessage,
@@ -154,10 +154,11 @@ export class CollectingClaimDataState implements ConversationStateHandler {
         response: {
           correlationId: payload.correlationId,
           contactKey: payload.contactKey,
-          status: 'claim_creation_failed',
-          shouldAskAgain: false,
-          assistantMessage:
-            'Tengo tus datos, pero no pude crear el reclamo en este momento. Estamos reintentando internamente.',
+          status: claimCreation.categoryUnavailable ? 'category_not_enabled' : 'claim_creation_failed',
+          shouldAskAgain: Boolean(claimCreation.categoryUnavailable),
+          assistantMessage: claimCreation.categoryUnavailable
+            ? 'Este tipo de reclamo no esta habilitado en el municipio de este canal. Podes consultar por otro problema municipal.'
+            : 'Tengo tus datos, pero no pude crear el reclamo en este momento. Volve a intentarlo mas tarde.',
           extractedData: {
             correo: mergedState.correo,
             dni: mergedState.dni,

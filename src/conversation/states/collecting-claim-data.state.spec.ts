@@ -19,6 +19,30 @@ const payload = {
 };
 
 describe('CollectingClaimDataState', () => {
+  it.each([
+    { outcome: { success: false, addressOutOfServiceArea: true, serviceArea: 'Funes' }, status: 'address_out_of_service_area', message: 'Funes' },
+    { outcome: { success: false, categoryUnavailable: true, error: 'disabled category' }, status: 'category_not_enabled', message: 'no esta habilitado' },
+    { outcome: { success: false, error: 'catalog unavailable' }, status: 'claim_creation_failed', message: 'Volve a intentarlo' },
+  ])('keeps the conversation open and explains $status', async ({ outcome, status, message }) => {
+    const support = {
+      isGreetingMessage: jest.fn().mockReturnValue(false),
+      parseClaimText: jest.fn().mockResolvedValue({ understood: true, confidence: 0.95, correo: 'test@example.com', problema: 'bache', direccion: 'Belgrano 123', categoria: 'baches_y_pavimento' }),
+      makeMensaje: jest.fn((origen, texto) => ({ origen, texto, creadoEn: new Date().toISOString() })),
+      appendAsistente: jest.fn((state) => state),
+      computeMissingFields: jest.fn().mockReturnValue([]),
+      createClaim: jest.fn().mockResolvedValue(outcome),
+    } as unknown as ConversationStateSupportService;
+    const handler = new CollectingClaimDataState(support);
+    const result = await handler.handle(payload, {
+      contactKey: payload.contactKey, phase: 'collecting_claim_data', greeted: true,
+      mensajes: [], updatedAt: new Date().toISOString(),
+    });
+    expect(result.state.phase).toBe('collecting_claim_data');
+    expect(result.response.status).toBe(status);
+    expect(result.response.assistantMessage).toContain(message);
+    if (status === 'address_out_of_service_area') expect(result.state.direccion).toBeUndefined();
+  });
+
   it('should keep collecting when required data is missing', async () => {
     const support = {
       isGreetingMessage: jest.fn().mockReturnValue(false),
@@ -88,7 +112,6 @@ describe('CollectingClaimDataState', () => {
           data: { lat: -34.6, lng: -58.4, direccion: 'Belgrano 123', problema: 'bache' },
         },
       }),
-      getAllowedAreasLabel: jest.fn(),
     } as unknown as ConversationStateSupportService;
 
     const handler = new CollectingClaimDataState(support);

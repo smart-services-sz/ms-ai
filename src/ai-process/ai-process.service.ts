@@ -30,9 +30,9 @@ export class AiProcessService {
       86400,
     );
 
-    if (!this.support.getAllowedAreaTokens().length) {
+    if (!this.configService.get<string>('AI_MUNICIPALITY_ID')) {
       this.logger.warn(
-        'GEO_ALLOWED_ADMIN_AREAS no esta configurado; la validacion de cobertura geografica quedara abierta',
+        'AI_MUNICIPALITY_ID no esta configurado; las altas conversacionales quedaran bloqueadas',
       );
     }
   }

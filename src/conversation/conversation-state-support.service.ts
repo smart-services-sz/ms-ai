@@ -34,6 +34,21 @@ type GeocodeRequestPayload = {
   city?: string;
 };
 
+type ClaimMunicipality = {
+  id: string;
+  name: string;
+  defaultCity?: string | null;
+  country: string;
+  isActive: boolean;
+  allowedCountries: string[];
+  allowedAdminAreas: string[];
+  categories: Array<{
+    code: string;
+    isActive: boolean;
+    defaultPriority: 'alta' | 'media' | 'baja';
+  }>;
+};
+
 export type CreateReclamoResponse = {
   correlationId: string;
   reclamoId: string;
@@ -394,35 +409,28 @@ export class ConversationStateSupportService {
     return !hasIdentity && !hasAddressLike && !hasProblemLike;
   }
 
-  getAllowedAreaTokens(): string[] {
-    return this.configService
-      .get<string>('GEO_ALLOWED_ADMIN_AREAS', '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-
-  getAllowedAreasLabel(): string {
-    return this.configService.get<string>(
-      'GEO_ALLOWED_ADMIN_AREAS',
-      'la zona de cobertura',
-    );
-  }
-
   async createClaim(
     payload: AiInboundPayloadDto,
     state: ConversationState,
   ): Promise<
     | { success: true; reclamo: CreateReclamoResponse }
-    | { success: false; addressOutOfServiceArea: true }
-    | { success: false; addressOutOfServiceArea?: false; error: string }
+    | { success: false; addressOutOfServiceArea: true; serviceArea: string }
+    | { success: false; addressOutOfServiceArea?: false; categoryUnavailable?: boolean; error: string }
   > {
     if (!state.problema || !state.direccion) {
       return { success: false, error: 'Datos incompletos para crear reclamo' };
     }
 
     try {
-      const geocode = await this.geocodeAddress(payload, state.direccion);
+      const municipality = await this.resolveClaimMunicipality();
+      const categoria = state.categoria || 'otros';
+      const category = municipality.categories.find(
+        (item) => item.code === categoria && item.isActive === true,
+      );
+      if (!category) {
+        return { success: false, categoryUnavailable: true, error: 'La categoria no esta habilitada para este municipio.' };
+      }
+      const geocode = await this.geocodeAddress(payload, state.direccion, municipality);
 
       if (!geocode || !geocode.data) {
         return {
@@ -431,21 +439,18 @@ export class ConversationStateSupportService {
         };
       }
 
-      if (!this.isWithinServiceArea(geocode)) {
+      if (!this.isWithinServiceArea(geocode, municipality)) {
         const components = geocode.data.addressComponents;
         this.logger.warn(
           `[${payload.correlationId}] Direccion fuera de zona de servicio | country=${components?.country} adminArea=${components?.adminArea}`,
         );
-        return { success: false, addressOutOfServiceArea: true };
+        return {
+          success: false, addressOutOfServiceArea: true,
+          serviceArea: municipality.defaultCity || municipality.name,
+        };
       }
 
-      const municipalityId = this.toTerritoryId(
-        geocode.data.addressComponents?.locality,
-      );
-      const areaId = this.toTerritoryId(
-        geocode.data.addressComponents?.adminArea,
-      );
-      const categoria = state.categoria || 'otros';
+      const municipalityId = municipality.id;
       const posiblesDuplicados = await this.findPossibleDuplicates({
         correlationId: payload.correlationId,
         problema: state.problema,
@@ -469,9 +474,8 @@ export class ConversationStateSupportService {
             lat: geocode.data.lat,
             lng: geocode.data.lng,
             categoria,
-            prioridad: state.prioridad || 'media',
+            prioridad: category.defaultPriority || 'media',
             municipalityId,
-            areaId,
             mensajes: state.mensajes || [],
             metadata: {
               geocodeStatus: geocode.status,
@@ -650,18 +654,13 @@ export class ConversationStateSupportService {
   private async geocodeAddress(
     payload: AiInboundPayloadDto,
     address: string,
+    municipality: ClaimMunicipality,
   ): Promise<GeocodeResponse> {
-    const country = this.configService.get<string>(
-      'GEO_DEFAULT_COUNTRY',
-      'Argentina',
-    );
-    const city = this.resolveCityHint(address);
-
     const requestPayload: GeocodeRequestPayload = {
       correlationId: payload.correlationId,
       address,
-      country,
-      ...(city ? { city } : {}),
+      country: municipality.country,
+      city: municipality.defaultCity || municipality.name,
     };
 
     return firstValueFrom(
@@ -671,88 +670,53 @@ export class ConversationStateSupportService {
     );
   }
 
-  private toTerritoryId(value?: string | null): string | undefined {
-    const normalized = value
+  private normalizeLocation(value?: string | null): string {
+    return value
       ?.trim()
       .toLowerCase()
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '');
-
-    return normalized || undefined;
+      .replace(/\s+/g, ' ') || '';
   }
 
-  private resolveCityHint(address: string): string | undefined {
-    const normalizedAddress = address.toLowerCase();
-    const allowedTokens = this.getAllowedAreaTokens();
-
-    const alreadyScoped = allowedTokens.some((token) =>
-      normalizedAddress.includes(token.toLowerCase()),
-    );
-    if (alreadyScoped) {
-      return undefined;
+  private async resolveClaimMunicipality(): Promise<ClaimMunicipality> {
+    const id = this.configService.get<string>('AI_MUNICIPALITY_ID')?.trim();
+    if (id && /^[a-z0-9]+(?:_[a-z0-9]+)*$/.test(id)) {
+      try {
+        const municipality = await firstValueFrom(
+          this.natsClient.send<ClaimMunicipality>('municipalities.config.get', {
+            data: { id }, context: { userId: 'ms-ai', ip: '' },
+          }).pipe(timeout(8000)),
+        );
+        if (municipality?.id === id && municipality.isActive === true) {
+          return municipality;
+        }
+      } catch {
+        this.logger.warn('No se pudo obtener la configuracion municipal del canal conversacional');
+      }
     }
-
-    const configuredCity = this.configService
-      .get<string>('GEO_DEFAULT_CITY')
-      ?.trim();
-    if (configuredCity) {
-      return configuredCity;
-    }
-
-    return allowedTokens[0];
+    throw new Error('El municipio del canal conversacional no esta disponible. Intenta nuevamente mas tarde.');
   }
 
-  private isWithinServiceArea(geocode: GeocodeResponse): boolean {
+  private isWithinServiceArea(geocode: GeocodeResponse, municipality: ClaimMunicipality): boolean {
     const components = geocode.data.addressComponents;
-    if (!components) {
-      return true;
-    }
-
-    const allowedCountries = this.configService
-      .get<string>('GEO_ALLOWED_COUNTRIES', 'Argentina')
-      .split(',')
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-
-    const allowedAdminAreas = this.configService
-      .get<string>('GEO_ALLOWED_ADMIN_AREAS', '')
-      .split(',')
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-
-    const country = (components.country || '').toLowerCase();
-    const adminArea = (components.adminArea || '').toLowerCase();
-    const locality = (components.locality || '').toLowerCase();
-
-    if (
-      allowedCountries.length &&
-      country &&
-      !allowedCountries.includes(country)
-    ) {
+    if (geocode.status !== 'geocode_ok' || !components ||
+        !Number.isFinite(geocode.data.lat) || !Number.isFinite(geocode.data.lng) ||
+        Math.abs(geocode.data.lat) > 90 || Math.abs(geocode.data.lng) > 180 ||
+        (geocode.data.lat === 0 && geocode.data.lng === 0)) {
       return false;
     }
 
-    if (allowedAdminAreas.length) {
-      const scopeCandidates = [adminArea, locality].filter(Boolean);
-
-      if (!scopeCandidates.length) {
-        return true;
-      }
-
-      const matchesScope = allowedAdminAreas.some((allowed) =>
-        scopeCandidates.some(
-          (candidate) =>
-            candidate.includes(allowed) || allowed.includes(candidate),
-        ),
-      );
-
-      if (!matchesScope) {
-        return false;
-      }
-    }
-
-    return true;
+    const country = this.normalizeLocation(components.country);
+    const locality = this.normalizeLocation(components.locality);
+    const adminArea = this.normalizeLocation(components.adminArea);
+    const allowedCountries = municipality.allowedCountries.length
+      ? municipality.allowedCountries : [municipality.country];
+    return Boolean(locality &&
+      locality === this.normalizeLocation(municipality.defaultCity || municipality.name) &&
+      allowedCountries.some((item) => this.normalizeLocation(item) === country) &&
+      (!municipality.allowedAdminAreas.length || municipality.allowedAdminAreas.some(
+        (item) => [locality, adminArea].includes(this.normalizeLocation(item)),
+      )));
   }
 }
