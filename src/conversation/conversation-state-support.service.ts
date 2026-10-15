@@ -56,6 +56,27 @@ export type CitizenFollowupResult = {
   assistantMessage: string;
 };
 
+export type PossibleDuplicateClaim = {
+  reclamoId: string;
+  codigoSeguimiento: string;
+  problema: string;
+  direccion: string;
+  estado: string;
+  distanciaMetros: number;
+  similitud: number;
+};
+
+type DuplicateClaimCandidate = {
+  id: string;
+  codigoSeguimiento: string;
+  problema: string;
+  direccion: string;
+  lat: number | string;
+  lng: number | string;
+  categoria: string;
+  estado: string;
+};
+
 @Injectable()
 export class ConversationStateSupportService {
   private readonly logger = new Logger(ConversationStateSupportService.name);
@@ -418,6 +439,23 @@ export class ConversationStateSupportService {
         return { success: false, addressOutOfServiceArea: true };
       }
 
+      const municipalityId = this.toTerritoryId(
+        geocode.data.addressComponents?.locality,
+      );
+      const areaId = this.toTerritoryId(
+        geocode.data.addressComponents?.adminArea,
+      );
+      const categoria = state.categoria || 'otros';
+      const posiblesDuplicados = await this.findPossibleDuplicates({
+        correlationId: payload.correlationId,
+        problema: state.problema,
+        direccion: geocode.data.formattedAddress || state.direccion,
+        lat: geocode.data.lat,
+        lng: geocode.data.lng,
+        categoria,
+        municipalityId,
+      });
+
       const reclamo = await firstValueFrom(
         this.natsClient
           .send<CreateReclamoResponse>('reclamos.create', {
@@ -430,19 +468,16 @@ export class ConversationStateSupportService {
             direccion: geocode.data.formattedAddress || state.direccion,
             lat: geocode.data.lat,
             lng: geocode.data.lng,
-            categoria: state.categoria || 'otros',
+            categoria,
             prioridad: state.prioridad || 'media',
-            municipalityId: this.toTerritoryId(
-              geocode.data.addressComponents?.locality,
-            ),
-            areaId: this.toTerritoryId(
-              geocode.data.addressComponents?.adminArea,
-            ),
+            municipalityId,
+            areaId,
             mensajes: state.mensajes || [],
             metadata: {
               geocodeStatus: geocode.status,
               geocodeProvider: geocode.data.provider,
               addressComponents: geocode.data.addressComponents,
+              ...(posiblesDuplicados.length > 0 ? { posiblesDuplicados } : {}),
             },
           })
           .pipe(timeout(10000)),
@@ -460,6 +495,156 @@ export class ConversationStateSupportService {
       );
       return { success: false, error: message };
     }
+  }
+
+  private async findPossibleDuplicates(input: {
+    correlationId: string;
+    problema: string;
+    direccion: string;
+    lat: number;
+    lng: number;
+    categoria: string;
+    municipalityId?: string;
+  }): Promise<PossibleDuplicateClaim[]> {
+    if (!input.municipalityId) return [];
+
+    try {
+      const activeClaims = await Promise.all(
+        (['pendiente', 'en_proceso'] as const).map((estado) =>
+          firstValueFrom(
+            this.natsClient
+              .send<{ items?: DuplicateClaimCandidate[] }>(
+                'reclamos.find-all',
+                {
+                  page: 1,
+                  limit: 100,
+                  estado,
+                  categoria: input.categoria,
+                  municipalityId: input.municipalityId,
+                  sortDirection: -1,
+                },
+              )
+              .pipe(timeout(4000)),
+          ),
+        ),
+      );
+
+      return activeClaims
+        .flatMap((result) => result.items ?? [])
+        .map((candidate) => this.scoreDuplicateCandidate(input, candidate))
+        .filter((candidate): candidate is PossibleDuplicateClaim =>
+          candidate !== null,
+        )
+        .sort(
+          (first, second) =>
+            second.similitud - first.similitud ||
+            first.distanciaMetros - second.distanciaMetros,
+        )
+        .slice(0, 3);
+    } catch {
+      this.logger.warn(
+        `[${input.correlationId}] No se pudo buscar duplicados; se continuara con la creacion del reclamo`,
+      );
+      return [];
+    }
+  }
+
+  private scoreDuplicateCandidate(
+    input: {
+      problema: string;
+      direccion: string;
+      lat: number;
+      lng: number;
+      categoria: string;
+    },
+    candidate: DuplicateClaimCandidate,
+  ): PossibleDuplicateClaim | null {
+    if (candidate.categoria !== input.categoria) return null;
+    const candidateLat = Number(candidate.lat);
+    const candidateLng = Number(candidate.lng);
+    if (!Number.isFinite(candidateLat) || !Number.isFinite(candidateLng)) {
+      return null;
+    }
+
+    const distanciaMetros = this.distanceMeters(
+      input.lat,
+      input.lng,
+      candidateLat,
+      candidateLng,
+    );
+    if (distanciaMetros > 120) return null;
+
+    const sameAddress =
+      this.normalizeDuplicateText(input.direccion) ===
+      this.normalizeDuplicateText(candidate.direccion);
+    const textSimilarity = this.textSimilarity(
+      input.problema,
+      candidate.problema,
+    );
+    if (!sameAddress && textSimilarity < 0.18 && distanciaMetros > 25) {
+      return null;
+    }
+
+    const proximityScore = Math.max(0, 1 - distanciaMetros / 120);
+    const similitud = Math.round(
+      (proximityScore * 0.55 + textSimilarity * 0.45) * 100,
+    );
+    return {
+      reclamoId: candidate.id,
+      codigoSeguimiento: candidate.codigoSeguimiento,
+      problema: candidate.problema,
+      direccion: candidate.direccion,
+      estado: candidate.estado,
+      distanciaMetros: Math.round(distanciaMetros),
+      similitud,
+    };
+  }
+
+  private distanceMeters(
+    firstLat: number,
+    firstLng: number,
+    secondLat: number,
+    secondLng: number,
+  ): number {
+    const radians = (degrees: number) => (degrees * Math.PI) / 180;
+    const latitudeDelta = radians(secondLat - firstLat);
+    const longitudeDelta = radians(secondLng - firstLng);
+    const haversine =
+      Math.sin(latitudeDelta / 2) ** 2 +
+      Math.cos(radians(firstLat)) *
+        Math.cos(radians(secondLat)) *
+        Math.sin(longitudeDelta / 2) ** 2;
+    return 6371000 * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+  }
+
+  private textSimilarity(first: string, second: string): number {
+    const stopWords = new Set([
+      'con', 'del', 'desde', 'el', 'en', 'la', 'las', 'los', 'por', 'un', 'una',
+    ]);
+    const tokens = (value: string) =>
+      new Set(
+        this.normalizeDuplicateText(value)
+          .split(' ')
+          .filter((token) => token.length > 2 && !stopWords.has(token)),
+      );
+    const firstTokens = tokens(first);
+    const secondTokens = tokens(second);
+    const union = new Set([...firstTokens, ...secondTokens]);
+    if (union.size === 0) return 0;
+    const intersection = [...firstTokens].filter((token) =>
+      secondTokens.has(token),
+    ).length;
+    return intersection / union.size;
+  }
+
+  private normalizeDuplicateText(value: string): string {
+    return value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .replace(/\s+/g, ' ');
   }
 
   private async geocodeAddress(

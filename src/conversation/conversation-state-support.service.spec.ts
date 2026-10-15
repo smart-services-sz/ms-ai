@@ -143,4 +143,153 @@ describe('ConversationStateSupportService citizen followup', () => {
     ).resolves.toBeNull();
     expect(natsClient.send).not.toHaveBeenCalled();
   });
+
+  it('stores nearby same-category open claims as suggestions without blocking creation', async () => {
+    const existingClaim = {
+      id: 'existing-claim-id',
+      codigoSeguimiento: 'REC-OLD123',
+      problema: 'Luminaria apagada en la esquina',
+      direccion: 'San Martin 123, Funes',
+      lat: -32.91,
+      lng: -60.81,
+      categoria: 'alumbrado',
+      estado: 'pendiente',
+    };
+    natsClient.send.mockImplementation((pattern: string, request: { estado?: string }) => {
+      if (pattern === 'geo.geocode-address') {
+        return of({
+          status: 'geocode_ok',
+          data: {
+            lat: -32.91,
+            lng: -60.81,
+            formattedAddress: 'San Martin 123, Funes',
+            provider: 'google-geocoding',
+            addressComponents: {
+              country: 'Argentina',
+              adminArea: 'Santa Fe',
+              locality: 'Funes',
+            },
+          },
+        });
+      }
+      if (pattern === 'reclamos.find-all') {
+        return of({
+          items:
+            request.estado === 'pendiente'
+              ? [
+                  existingClaim,
+                  {
+                    ...existingClaim,
+                    id: 'other-category',
+                    codigoSeguimiento: 'REC-OTHER1',
+                    categoria: 'residuos',
+                  },
+                  {
+                    ...existingClaim,
+                    id: 'far-away',
+                    codigoSeguimiento: 'REC-FAR123',
+                    lat: -32.95,
+                    lng: -60.85,
+                  },
+                ]
+              : [],
+          pagination: { totalItems: 3 },
+        });
+      }
+      return of({
+        reclamoId: 'new-claim-id',
+        trackingCode: 'REC-NEW123',
+        status: 'created',
+        createdAt: new Date().toISOString(),
+        message: 'Reclamo creado',
+        data: { problema: 'Luminaria apagada en la esquina', direccion: 'San Martin 123, Funes', lat: -32.91, lng: -60.81 },
+      });
+    });
+
+    const result = await service.createClaim(payload(''), {
+      contactKey: payload('').contactKey,
+      phase: 'collecting_claim_data',
+      greeted: true,
+      correo: 'citizen@example.com',
+      problema: 'Luminaria apagada en la esquina',
+      direccion: 'San Martin 123',
+      categoria: 'alumbrado',
+      prioridad: 'media',
+      mensajes: [],
+      updatedAt: new Date().toISOString(),
+    });
+
+    expect(result.success).toBe(true);
+    const createCall = natsClient.send.mock.calls.find(
+      ([pattern]) => pattern === 'reclamos.create',
+    );
+    expect(createCall?.[1].metadata.posiblesDuplicados).toEqual([
+      expect.objectContaining({
+        reclamoId: 'existing-claim-id',
+        codigoSeguimiento: 'REC-OLD123',
+        distanciaMetros: 0,
+      }),
+    ]);
+    expect(createCall?.[1].metadata.posiblesDuplicados).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reclamoId: 'other-category' }),
+        expect.objectContaining({ reclamoId: 'far-away' }),
+      ]),
+    );
+    expect(natsClient.send).toHaveBeenCalledWith(
+      'reclamos.find-all',
+      expect.objectContaining({ estado: 'pendiente', categoria: 'alumbrado', municipalityId: 'funes' }),
+    );
+    expect(natsClient.send).toHaveBeenCalledWith(
+      'reclamos.find-all',
+      expect.objectContaining({ estado: 'en_proceso', categoria: 'alumbrado', municipalityId: 'funes' }),
+    );
+  });
+
+  it('continues claim creation if duplicate lookup is unavailable', async () => {
+    natsClient.send.mockImplementation((pattern: string) => {
+      if (pattern === 'geo.geocode-address') {
+        return of({
+          status: 'geocode_ok',
+          data: {
+            lat: -32.91,
+            lng: -60.81,
+            formattedAddress: 'San Martin 123, Funes',
+            provider: 'google-geocoding',
+            addressComponents: { country: 'Argentina', adminArea: 'Santa Fe', locality: 'Funes' },
+          },
+        });
+      }
+      if (pattern === 'reclamos.find-all') {
+        throw new Error('claims query unavailable');
+      }
+      return of({
+        reclamoId: 'new-claim-id',
+        trackingCode: 'REC-NEW123',
+        status: 'created',
+        createdAt: new Date().toISOString(),
+        message: 'Reclamo creado',
+        data: { problema: 'Bache', direccion: 'San Martin 123, Funes', lat: -32.91, lng: -60.81 },
+      });
+    });
+
+    await expect(
+      service.createClaim(payload(''), {
+        contactKey: payload('').contactKey,
+        phase: 'collecting_claim_data',
+        greeted: true,
+        correo: 'citizen@example.com',
+        problema: 'Bache',
+        direccion: 'San Martin 123',
+        categoria: 'baches_y_pavimento',
+        prioridad: 'media',
+        mensajes: [],
+        updatedAt: new Date().toISOString(),
+      }),
+    ).resolves.toMatchObject({ success: true });
+    expect(natsClient.send).toHaveBeenCalledWith(
+      'reclamos.create',
+      expect.objectContaining({ canal: 'whatsapp' }),
+    );
+  });
 });
