@@ -27,11 +27,11 @@ export class PromptInjectionStrategy implements InputSecurityStrategy {
     /\[UNRESTRICTED\]/gi,
   ];
 
-  validate(input: string, clientId?: string): void {
+  validate(input: string, _clientId?: string): void {
     for (const pattern of this.injectionPatterns) {
       if (pattern.test(input)) {
         this.logger.warn(
-          `Intento de prompt injection detectado: "${input.substring(0, 100)}" | clientId=${clientId}`,
+          `Intento de prompt injection detectado | inputLength=${input.length} | category=prompt_injection`,
         );
         throw new BadRequestException(
           'Solicitud rechazada por validación de seguridad.',

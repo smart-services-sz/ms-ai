@@ -80,7 +80,7 @@ export class AiSecurityService {
 
       if (minCount > this.MAX_REQUESTS_PER_MINUTE) {
         this.logger.warn(
-          `Rate limit por minuto excedido: clientId=${clientId} | requests=${minCount} | max=${this.MAX_REQUESTS_PER_MINUTE}`,
+          `Rate limit por minuto excedido | requests=${minCount} | max=${this.MAX_REQUESTS_PER_MINUTE}`,
         );
         return false;
       }
@@ -96,7 +96,7 @@ export class AiSecurityService {
 
       if (hourCount > this.MAX_REQUESTS_PER_HOUR) {
         this.logger.warn(
-          `Rate limit por hora excedido: clientId=${clientId} | requests=${hourCount} | max=${this.MAX_REQUESTS_PER_HOUR}`,
+          `Rate limit por hora excedido | requests=${hourCount} | max=${this.MAX_REQUESTS_PER_HOUR}`,
         );
         return false;
       }
@@ -104,10 +104,10 @@ export class AiSecurityService {
       return true;
     } catch (error) {
       this.logger.error(
-        `Error verificando rate limit en Redis: ${error instanceof Error ? error.message : String(error)}`,
+        `Error verificando rate limit en Redis | error=${error instanceof Error ? error.name : 'UnknownError'}`,
       );
       // Si Redis falla, permitir pero loguear el error
-      this.logger.warn(`Rate limit bypass debido a error de Redis para cliente: ${clientId}`);
+      this.logger.warn('Rate limit bypass debido a error de Redis');
       return true;
     }
   }
@@ -164,14 +164,14 @@ export class AiSecurityService {
       'otros'
     ];
     if (aiResponse.categoria && !validCategories.includes(aiResponse.categoria as string)) {
-      this.logger.warn(`Categoría inválida detectada: ${aiResponse.categoria}`);
+      this.logger.warn('Categoría inválida detectada');
       return false;
     }
 
     // Validar que la prioridad está en el conjunto permitido
     const validPriorities = ['alta', 'media', 'baja'];
     if (aiResponse.prioridad && !validPriorities.includes(aiResponse.prioridad as string)) {
-      this.logger.warn(`Prioridad inválida detectada: ${aiResponse.prioridad}`);
+      this.logger.warn('Prioridad inválida detectada');
       return false;
     }
 
@@ -215,7 +215,7 @@ export class AiSecurityService {
       };
     } catch (error) {
       this.logger.error(
-        `Error obteniendo estadísticas: ${error instanceof Error ? error.message : String(error)}`,
+        `Error obteniendo estadísticas | error=${error instanceof Error ? error.name : 'UnknownError'}`,
       );
       return {
         totalClients: 0,
@@ -243,7 +243,7 @@ export class AiSecurityService {
       );
     } catch (error) {
       this.logger.error(
-        `Error durante cleanup: ${error instanceof Error ? error.message : String(error)}`,
+        `Error durante cleanup | error=${error instanceof Error ? error.name : 'UnknownError'}`,
       );
     }
   }

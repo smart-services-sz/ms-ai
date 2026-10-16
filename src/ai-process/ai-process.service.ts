@@ -39,11 +39,7 @@ export class AiProcessService {
 
   async processInboundMessage(payload: AiInboundPayloadDto) {
     this.logger.log(
-      `[${payload.correlationId}] Mensaje recibido desde gateway | contactKey=${payload.contactKey} | canal=${payload.channel} | mensajes=${payload.messageCount}`,
-    );
-
-    this.logger.log(
-      `[${payload.correlationId}] consolidatedText: "${payload.consolidatedText}"`,
+      `[${payload.correlationId}] Mensaje recibido desde gateway | canal=${payload.channel} | mensajes=${payload.messageCount}`,
     );
 
     const currentState =

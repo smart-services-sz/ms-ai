@@ -39,13 +39,13 @@ export class ClaimKeywordStrategy implements InputSecurityStrategy {
     'denunciar',
   ];
 
-  validate(input: string, clientId?: string): void {
+  validate(input: string, _clientId?: string): void {
     if (input.length > 20 || this.hasClaimKeywords(input)) {
       return;
     }
 
     this.logger.warn(
-      `Input demasiado corto sin keywords de reclamo: "${input}" | clientId=${clientId}`,
+      `Input demasiado corto sin keywords de reclamo | inputLength=${input.length}`,
     );
     throw new BadRequestException(
       'Por favor describe tu reclamo con más detalle.',

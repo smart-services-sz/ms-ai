@@ -129,9 +129,8 @@ export class AiInterpreterService {
       // Incrementar contador de fallos
       this.openaiFailureCount++;
       
-      const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(
-        `Fallo interpretacion con OpenAI (${this.openaiFailureCount}/${this.MAX_FAILURES_BEFORE_FALLBACK}): ${message}`,
+        `Fallo interpretacion con OpenAI | attempt=${this.openaiFailureCount} | maxAttempts=${this.MAX_FAILURES_BEFORE_FALLBACK} | error=${error instanceof Error ? error.name : 'UnknownError'}`,
       );
 
       if (this.openaiFailureCount >= this.MAX_FAILURES_BEFORE_FALLBACK) {

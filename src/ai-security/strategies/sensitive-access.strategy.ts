@@ -29,13 +29,13 @@ export class SensitiveAccessStrategy implements InputSecurityStrategy {
     'xss',
   ];
 
-  validate(input: string, clientId?: string): void {
+  validate(input: string, _clientId?: string): void {
     const lowerInput = input.toLowerCase();
 
     for (const keyword of this.sensitiveRequests) {
       if (lowerInput.includes(keyword)) {
         this.logger.warn(
-          `Intento de acceso a información sensible: "${input.substring(0, 100)}" | clientId=${clientId}`,
+          `Intento de acceso a información sensible | inputLength=${input.length} | category=sensitive_access`,
         );
         throw new BadRequestException(
           'Solicitud rechazada por validación de seguridad.',
